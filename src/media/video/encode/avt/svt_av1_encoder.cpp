@@ -169,17 +169,14 @@ int SvtAv1Encoder::Reconfigure(uint32_t frame_width, uint32_t frame_height) {
   enc_config_.encoder_bit_depth = 8;
   enc_config_.frame_rate_numerator = max_fps_;
   enc_config_.frame_rate_denominator = 1;
-  enc_config_.enc_mode =
-      video_degradation_preference_ ==
-              MiniRtcVideoDegradationPreference::MaintainFrameRate
-          ? 10
-          : 8;
+  // Use real-time low-latency preset 10 for responsive full-screen window switches.
+  enc_config_.enc_mode = 10;
   enc_config_.rate_control_mode = SVT_AV1_RC_MODE_CBR;
   enc_config_.pred_structure = SVT_AV1_PRED_LOW_DELAY_B;
   enc_config_.target_bit_rate = target_bitrate_;
   enc_config_.over_shoot_pct =
       EncoderOvershootPercent(target_bitrate_, max_bitrate_);
-  enc_config_.max_qp_allowed = 60;
+  enc_config_.max_qp_allowed = 38;
   enc_config_.min_qp_allowed = 10;
   enc_config_.intra_period_length = key_frame_interval_;
   enc_config_.screen_content_mode =
