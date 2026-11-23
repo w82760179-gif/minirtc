@@ -3271,7 +3271,7 @@ int IceTransportController::CreateCodecs(std::shared_ptr<SystemClock> clock,
   int ret = -1;
 
   if (rtp::PAYLOAD_TYPE::AV1 == video_pt) {
-#if defined(__APPLE__) || defined(__ANDROID__) || defined(__OHOS__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__) || defined(__OHOS__)
     ret = CreateStreamCodecs(clock, hardware_acceleration_,
                              VideoCodecType::AV1);
 #else

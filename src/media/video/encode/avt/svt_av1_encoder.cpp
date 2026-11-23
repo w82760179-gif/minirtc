@@ -176,7 +176,7 @@ int SvtAv1Encoder::Reconfigure(uint32_t frame_width, uint32_t frame_height) {
   enc_config_.target_bit_rate = target_bitrate_;
   enc_config_.over_shoot_pct =
       EncoderOvershootPercent(target_bitrate_, max_bitrate_);
-  enc_config_.max_qp_allowed = 38;
+  enc_config_.max_qp_allowed = 30;
   enc_config_.min_qp_allowed = 10;
   enc_config_.intra_period_length = key_frame_interval_;
   enc_config_.screen_content_mode =

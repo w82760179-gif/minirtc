@@ -700,11 +700,16 @@ int DataChannelTransport::CreateCodecs(std::shared_ptr<SystemClock> clock,
   int ret = -1;
 
   if (rtp::PAYLOAD_TYPE::AV1 == video_pt) {
+#if defined(_WIN32)
+    ret = CreateStreamCodecs(clock, hardware_acceleration_,
+                             VideoCodecType::AV1);
+#else
     if (hardware_acceleration_) {
       hardware_acceleration_ = false;
       LOG_WARN("Only support software codec for AV1");
     }
     ret = CreateStreamCodecs(clock, false, VideoCodecType::AV1);
+#endif
   } else if (rtp::PAYLOAD_TYPE::H264 == video_pt) {
 #if defined(_WIN32) || defined(__APPLE__)
     ret = CreateStreamCodecs(clock, hardware_acceleration_,
