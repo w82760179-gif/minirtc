@@ -159,18 +159,22 @@ std::vector<AndroidCodecInfo> FindAndroidCodecs(VideoCodecType type,
         }
         if (!avc_level) return;
       }
+      int wa = 2, ha = 2;
       if (width > 0 && height > 0) {
         auto video = e->CallObjectMethod(caps, video_id);
         if (!video) return;
+        const int raw_wa = e->CallIntMethod(video, width_alignment);
+        const int raw_ha = e->CallIntMethod(video, height_alignment);
+        if (raw_wa >= 2 && raw_wa <= 128) wa = raw_wa;
+        if (raw_ha >= 2 && raw_ha <= 128) ha = raw_ha;
         if (!e->CallBooleanMethod(video, size_id, width, height)) {
-          // Some OMX encoders advertise macroblock alignment even though
-          // configure accepts visible dimensions and writes SPS cropping.
-          const int wa = e->CallIntMethod(video, width_alignment);
-          const int ha = e->CallIntMethod(video, height_alignment);
-          if (!encoder || wa <= 0 || ha <= 0 || wa > 128 || ha > 128 ||
-              !e->CallBooleanMethod(video, size_id,
-                                    ((width + wa - 1) / wa) * wa,
-                                    ((height + ha - 1) / ha) * ha))
+          // Both hardware encoders and decoders (e.g. MediaTek Codec2 AV1 with
+          // 16/32/64 alignment) reject unaligned visible sizes like 1050x742,
+          // 1650x1166, 2400x1696, or 3000x2120 in isSizeSupported even though
+          // MediaCodec handles them via internal alignment + crop rect.
+          const int aligned_w = ((width + wa - 1) / wa) * wa;
+          const int aligned_h = ((height + ha - 1) / ha) * ha;
+          if (!e->CallBooleanMethod(video, size_id, aligned_w, aligned_h))
             return;
         }
       }
@@ -190,7 +194,7 @@ std::vector<AndroidCodecInfo> FindAndroidCodecs(VideoCodecType type,
       if (encoder && !color) return;
       bool low_latency = e->CallBooleanMethod(caps, feature_id,
                                               e->NewStringUTF("low-latency"));
-      if (env.Ok()) result.push_back({name, color, avc_level, low_latency});
+      if (env.Ok()) result.push_back({name, color, avc_level, low_latency, wa, ha});
     }();
     if (e->ExceptionCheck()) e->ExceptionClear();
     e->PopLocalFrame(nullptr);

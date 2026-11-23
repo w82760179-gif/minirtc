@@ -28,6 +28,8 @@ struct AndroidCodecInfo {
   int color = 0;
   int avc_level = 0;
   bool low_latency = false;
+  int width_alignment = 2;
+  int height_alignment = 2;
 };
 // A zero size queries availability; a concrete size also checks video limits.
 std::vector<AndroidCodecInfo> FindAndroidCodecs(VideoCodecType type,

@@ -4,10 +4,16 @@
 #include <strmif.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <utility>
 #include <vector>
 
 #include "avt/svt_av1_encoder.h"
@@ -50,12 +56,24 @@ int EffectiveTargetBitrate(const MediaCodecConfig& config) {
 }
 
 int ComputePeakBitrate(int target_bps, int max_bps) {
-  const int64_t burst = static_cast<int64_t>(target_bps) * 5 / 4;
+  const int64_t burst = static_cast<int64_t>(target_bps) * 3 / 2;
   const int64_t cap =
       max_bps > 0 ? std::max<int64_t>(target_bps, max_bps) : burst;
   const int64_t clamped = std::min<int64_t>(
       std::min<int64_t>(burst, cap), std::numeric_limits<int>::max());
   return static_cast<int>(std::max<int64_t>(target_bps, clamped));
+}
+
+ULONG SelectQualityVsSpeed(const MediaCodecConfig& config) {
+  if (config.video_degradation_preference ==
+      MiniRtcVideoDegradationPreference::MaintainFrameRate) {
+    return 0;
+  }
+  // Benchmarked on Intel Arc hardware AV1 MFT: QvS=50 stays ~15 ms (64 FPS)
+  // up to 2400x1696, while QvS=25 keeps 3000x2120 at ~13.8 ms (72 FPS).
+  const int64_t pixels =
+      static_cast<int64_t>(config.init_width) * config.init_height;
+  return pixels > 4200000 ? 25 : 50;
 }
 
 bool ValidConfig(const MediaCodecConfig& config) {
@@ -67,6 +85,62 @@ bool ValidConfig(const MediaCodecConfig& config) {
          config.max_bitrate >= 0 && config.max_frame_rate > 0 &&
          config.max_frame_rate <= 240 && config.key_frame_interval > 0;
 }
+
+struct AsyncEventQueue {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::queue<std::pair<HRESULT, ComPtr<IMFMediaEvent>>> items;
+  bool pending = false;
+};
+
+class MftEventCallback final : public IMFAsyncCallback {
+ public:
+  MftEventCallback(ComPtr<IMFMediaEventGenerator> gen,
+                   std::shared_ptr<AsyncEventQueue> queue)
+      : gen_(std::move(gen)), queue_(std::move(queue)) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+    if (!ppv) return E_POINTER;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback)) {
+      *ppv = static_cast<IMFAsyncCallback*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return static_cast<ULONG>(
+        ref_count_.fetch_add(1, std::memory_order_relaxed) + 1);
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG count = static_cast<ULONG>(
+        ref_count_.fetch_sub(1, std::memory_order_acq_rel) - 1);
+    if (count == 0) delete this;
+    return count;
+  }
+  HRESULT STDMETHODCALLTYPE GetParameters(DWORD* flags, DWORD* queue) override {
+    if (flags) *flags = 0;
+    if (queue) *queue = MFASYNC_CALLBACK_QUEUE_MULTITHREADED;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE Invoke(IMFAsyncResult* result) override {
+    ComPtr<IMFMediaEvent> event;
+    const HRESULT hr = gen_->EndGetEvent(result, &event);
+    {
+      std::lock_guard<std::mutex> lock(queue_->mutex);
+      queue_->pending = false;
+      queue_->items.emplace(hr, std::move(event));
+    }
+    queue_->cv.notify_one();
+    return S_OK;
+  }
+
+ private:
+  std::atomic<long> ref_count_{1};
+  ComPtr<IMFMediaEventGenerator> gen_;
+  std::shared_ptr<AsyncEventQueue> queue_;
+};
 }  // namespace
 
 class WmfAv1Encoder::Impl {
@@ -81,6 +155,8 @@ class WmfAv1Encoder::Impl {
   }
 
   void Reset() {
+    event_callback_.Reset();
+    event_queue_.reset();
     events_.Reset();
     api_.Reset();
     wmf::ShutdownTransform(encoder_);
@@ -107,6 +183,8 @@ class WmfAv1Encoder::Impl {
       if (FAILED(hr)) return hr;
       hr = encoder_.As(&events_);
       if (FAILED(hr)) return hr;
+      event_queue_ = std::make_shared<AsyncEventQueue>();
+      event_callback_.Attach(new MftEventCallback(events_, event_queue_));
     }
     DWORD inputs = 0, outputs = 0;
     hr = encoder_->GetStreamCount(&inputs, &outputs);
@@ -140,10 +218,7 @@ class WmfAv1Encoder::Impl {
     SetUint(api_.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
     SetUint(api_.Get(), CODECAPI_AVEncMPVGOPSize, config_.key_frame_interval);
     SetUint(api_.Get(), CODECAPI_AVEncCommonQualityVsSpeed,
-            config_.video_degradation_preference ==
-                    MiniRtcVideoDegradationPreference::MaintainFrameRate
-                ? 0
-                : 50);
+            SelectQualityVsSpeed(config_));
 
     ComPtr<IMFMediaType> output, input;
     hr = MFCreateMediaType(&output);
@@ -209,11 +284,12 @@ class WmfAv1Encoder::Impl {
           WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8), nullptr,
                               nullptr);
           LOG_INFO(
-              "Media Foundation hardware AV1 encoder: {} (rc={}, {}x{} @ {}fps, "
-              "target={} bps, max={} bps)",
+              "Media Foundation hardware AV1 encoder: {} (rc={}, qvs={}, "
+              "{}x{} @ {}fps, target={} bps, max={} bps)",
               utf8, peak_constrained_vbr_ ? "PeakConstrainedVBR" : "CBR",
-              config_.init_width, config_.init_height, config_.max_frame_rate,
-              config_.init_bitrate, config_.max_bitrate);
+              SelectQualityVsSpeed(config_), config_.init_width,
+              config_.init_height, config_.max_frame_rate, config_.init_bitrate,
+              config_.max_bitrate);
           activations[i]->DetachObject();
         }
       }
@@ -306,26 +382,7 @@ class WmfAv1Encoder::Impl {
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     bool submitted = false;
     while (std::chrono::steady_clock::now() < deadline) {
-      bool have_output = !async_;
-      bool received_event = false;
-      if (async_) {
-        ComPtr<IMFMediaEvent> event;
-        hr = events_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
-        if (hr != MF_E_NO_EVENTS_AVAILABLE) {
-          if (FAILED(hr)) return hr;
-          received_event = true;
-          HRESULT status = S_OK;
-          hr = event->GetStatus(&status);
-          if (FAILED(hr)) return hr;
-          if (FAILED(status)) return status;
-          MediaEventType type = MEUnknown;
-          hr = event->GetType(&type);
-          if (FAILED(hr)) return hr;
-          if (type == METransformNeedInput) ++input_credit_;
-          if (type == METransformHaveOutput) have_output = true;
-        }
-      }
-      if (!submitted && (!async_ || input_credit_)) {
+      if (!submitted && (!async_ || input_credit_ > 0)) {
         hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
         if (SUCCEEDED(hr)) {
           submitted = true;
@@ -333,6 +390,21 @@ class WmfAv1Encoder::Impl {
         } else if (hr != MF_E_NOTACCEPTING) {
           return hr;
         }
+      }
+      bool have_output = !async_;
+      if (async_) {
+        ComPtr<IMFMediaEvent> event;
+        hr = NextAsyncEvent(deadline, event);
+        if (FAILED(hr)) return hr;
+        HRESULT status = S_OK;
+        hr = event->GetStatus(&status);
+        if (FAILED(hr)) return hr;
+        if (FAILED(status)) return status;
+        MediaEventType type = MEUnknown;
+        hr = event->GetType(&type);
+        if (FAILED(hr)) return hr;
+        if (type == METransformNeedInput) ++input_credit_;
+        if (type == METransformHaveOutput) have_output = true;
       }
       if (have_output) {
         ComPtr<IMFSample> output;
@@ -354,8 +426,6 @@ class WmfAv1Encoder::Impl {
           return S_OK;
         }
       }
-      if (!received_event)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
   }
@@ -363,8 +433,47 @@ class WmfAv1Encoder::Impl {
   wmf::CodecThread worker_;
   std::shared_ptr<SystemClock> clock_;
   MediaCodecConfig config_;
+  HRESULT NextAsyncEvent(std::chrono::steady_clock::time_point deadline,
+                         ComPtr<IMFMediaEvent>& event_out) {
+    if (!events_ || !event_queue_ || !event_callback_) return E_UNEXPECTED;
+    for (;;) {
+      bool start_get_event = false;
+      {
+        std::unique_lock<std::mutex> lock(event_queue_->mutex);
+        if (!event_queue_->items.empty()) {
+          auto item = std::move(event_queue_->items.front());
+          event_queue_->items.pop();
+          event_out = std::move(item.second);
+          return item.first;
+        }
+        if (!event_queue_->pending) {
+          event_queue_->pending = true;
+          start_get_event = true;
+        } else {
+          if (!event_queue_->cv.wait_until(
+                  lock, deadline,
+                  [&] { return !event_queue_->items.empty(); })) {
+            return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+          }
+          continue;
+        }
+      }
+      if (start_get_event) {
+        const HRESULT hr =
+            events_->BeginGetEvent(event_callback_.Get(), nullptr);
+        if (FAILED(hr)) {
+          std::lock_guard<std::mutex> lock(event_queue_->mutex);
+          event_queue_->pending = false;
+          return hr;
+        }
+      }
+    }
+  }
+
   ComPtr<IMFTransform> encoder_;
   ComPtr<IMFMediaEventGenerator> events_;
+  std::shared_ptr<AsyncEventQueue> event_queue_;
+  ComPtr<IMFAsyncCallback> event_callback_;
   ComPtr<ICodecAPI> api_;
   DWORD input_id_ = 0, output_id_ = 0;
   unsigned input_credit_ = 0;
