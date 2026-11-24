@@ -34,7 +34,9 @@ constexpr std::pair<int, int> kResolutionSteps[] = {
 // does not require exactly twice the bitrate, while still giving it enough
 // headroom to avoid spending the extra frames on coarse quantization.
 constexpr float kBitrateAlpha = 1.0f;
-constexpr float kBitrateCoeff30Fps = 2.70f;
+// Calibrated for AV1 hardware desktop text (2.70 was H.264 and forced
+// 1080p@60fps into >9 Mbps budgets, crushing 5 Mbps relay links to 180p).
+constexpr float kBitrateCoeff30Fps = 1.20f;
 constexpr float kReferenceFrameRate = 30.0f;
 // Reserve media-pipeline headroom when every captured frame matters. Without
 // this margin, normal throughput variance keeps the pipeline on the edge of
@@ -62,7 +64,7 @@ constexpr float kUpscaleStep = 1.0f / kDownscaleStep;
 
 libyuv::FilterMode ScaleFilterForContent(MiniRtcVideoContentType content_type) {
   return content_type == MiniRtcVideoContentType::ScreenContent
-             ? libyuv::kFilterBox
+             ? libyuv::kFilterBilinear
              : libyuv::kFilterLinear;
 }
 
@@ -233,18 +235,33 @@ ResolutionBitrateLimits ResolutionAdapter::ComputeBitrateLimitsForResolution(
 std::vector<ResolutionBitrateLimits> ResolutionAdapter::GetBitrateLimits()
     const {
   const int max_pixels = GetMaxPixelsForQuality();
+  // Keep remote desktop text readable: floor ScreenContent at 720p for
+  // Medium/High quality (and 540p for Low quality so aspect-ratio snapping
+  // never fails when max_pixels == 720p).
+  const int min_pixels =
+      video_content_type_ == MiniRtcVideoContentType::ScreenContent
+          ? (max_pixels > 1280 * 720 ? 1280 * 720 : 960 * 540)
+          : 0;
 
   std::vector<ResolutionBitrateLimits> limits;
   limits.reserve(std::size(kResolutionSteps));
 
+  int first_valid_idx = -1;
   int last_valid_idx = -1;
   for (int i = 0; i < static_cast<int>(std::size(kResolutionSteps)); ++i) {
-    if (kResolutionSteps[i].first * kResolutionSteps[i].second <= max_pixels) {
+    const int pixels = kResolutionSteps[i].first * kResolutionSteps[i].second;
+    if (pixels <= max_pixels) {
+      if (first_valid_idx < 0 && pixels >= min_pixels) {
+        first_valid_idx = i;
+      }
       last_valid_idx = i;
     }
   }
+  if (first_valid_idx < 0 || first_valid_idx > last_valid_idx) {
+    first_valid_idx = 0;
+  }
 
-  for (int i = 0; i <= last_valid_idx; ++i) {
+  for (int i = first_valid_idx; i <= last_valid_idx; ++i) {
     const auto [w, h] = kResolutionSteps[i];
     limits.push_back(
         ComputeBitrateLimitsForResolution(w, h, i == last_valid_idx));
@@ -307,9 +324,21 @@ int ResolutionAdapter::GetResolution(int target_bitrate, int current_width,
       std::max(static_cast<float>(min_pixels),
                std::min(estimated_pixels_f, static_cast<float>(max_pixels)))));
 
-  if (!BuildStrictAspectResolution(current_width, current_height,
-                                   estimated_pixels, min_pixels, max_pixels,
-                                   target_width, target_height)) {
+  const int fallback_540p = std::min(960 * 540, max_pixels);
+  const int fallback_180p = std::min(320 * 180, max_pixels);
+  const bool built =
+      BuildStrictAspectResolution(current_width, current_height,
+                                  estimated_pixels, min_pixels, max_pixels,
+                                  target_width, target_height) ||
+      (fallback_540p < min_pixels &&
+       BuildStrictAspectResolution(current_width, current_height,
+                                   estimated_pixels, fallback_540p, max_pixels,
+                                   target_width, target_height)) ||
+      (fallback_180p < min_pixels &&
+       BuildStrictAspectResolution(current_width, current_height,
+                                   estimated_pixels, fallback_180p, max_pixels,
+                                   target_width, target_height));
+  if (!built) {
     *target_width = -1;
     *target_height = -1;
     return -1;

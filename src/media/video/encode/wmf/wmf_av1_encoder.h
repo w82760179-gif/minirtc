@@ -24,6 +24,8 @@ class WmfAv1Encoder final : public MediaCodec {
   int SetTargetFrameRate(int frame_rate) override;
   bool SupportsInputFrameRateUpdates() const override { return true; }
   int SetInputFrameRate(int frame_rate) override;
+  bool SupportsDynamicEncodingSpeedPriority() const override { return true; }
+  int SetPrioritizeEncodingSpeedOverQuality(bool prioritize_speed) override;
   int GetResolution(int* width, int* height) const override;
   std::string GetEncoderName() const override;
 

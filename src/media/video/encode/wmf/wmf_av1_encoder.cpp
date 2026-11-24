@@ -56,7 +56,9 @@ int EffectiveTargetBitrate(const MediaCodecConfig& config) {
 }
 
 int ComputePeakBitrate(int target_bps, int max_bps) {
-  const int64_t burst = static_cast<int64_t>(target_bps) * 3 / 2;
+  // Keep PeakConstrainedVBR bursts smooth (1.20x) so keyframes and fast
+  // scrolling do not overflow shallow cellular/TURN UDP queues.
+  const int64_t burst = static_cast<int64_t>(target_bps) * 6 / 5;
   const int64_t cap =
       max_bps > 0 ? std::max<int64_t>(target_bps, max_bps) : burst;
   const int64_t clamped = std::min<int64_t>(
@@ -64,16 +66,21 @@ int ComputePeakBitrate(int target_bps, int max_bps) {
   return static_cast<int>(std::max<int64_t>(target_bps, clamped));
 }
 
-ULONG SelectQualityVsSpeed(const MediaCodecConfig& config) {
-  if (config.video_degradation_preference ==
-      MiniRtcVideoDegradationPreference::MaintainFrameRate) {
+ULONG SelectQualityVsSpeed(const MediaCodecConfig& config,
+                           bool speed_priority = false) {
+  if (speed_priority ||
+      config.video_degradation_preference ==
+          MiniRtcVideoDegradationPreference::MaintainFrameRate) {
     return 0;
   }
-  // Benchmarked on Intel Arc hardware AV1 MFT: QvS=50 stays ~15 ms (64 FPS)
-  // up to 2400x1696, while QvS=25 keeps 3000x2120 at ~13.8 ms (72 FPS).
+  // At 60 fps (16.6 ms budget) or >4.2M px, QvS=25 keeps Intel Arc AV1 encode
+  // well within budget while preserving sharp desktop text.
   const int64_t pixels =
       static_cast<int64_t>(config.init_width) * config.init_height;
-  return pixels > 4200000 ? 25 : 50;
+  if (config.max_frame_rate > 30 || pixels > 4200000) {
+    return 25;
+  }
+  return 50;
 }
 
 bool ValidConfig(const MediaCodecConfig& config) {
@@ -217,8 +224,8 @@ class WmfAv1Encoder::Impl {
     api_->SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
     SetUint(api_.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
     SetUint(api_.Get(), CODECAPI_AVEncMPVGOPSize, config_.key_frame_interval);
-    SetUint(api_.Get(), CODECAPI_AVEncCommonQualityVsSpeed,
-            SelectQualityVsSpeed(config_));
+    applied_qvs_ = SelectQualityVsSpeed(config_, speed_priority_);
+    SetUint(api_.Get(), CODECAPI_AVEncCommonQualityVsSpeed, applied_qvs_);
 
     ComPtr<IMFMediaType> output, input;
     hr = MFCreateMediaType(&output);
@@ -287,7 +294,7 @@ class WmfAv1Encoder::Impl {
               "Media Foundation hardware AV1 encoder: {} (rc={}, qvs={}, "
               "{}x{} @ {}fps, target={} bps, max={} bps)",
               utf8, peak_constrained_vbr_ ? "PeakConstrainedVBR" : "CBR",
-              SelectQualityVsSpeed(config_), config_.init_width,
+              applied_qvs_, config_.init_width,
               config_.init_height, config_.max_frame_rate, config_.init_bitrate,
               config_.max_bitrate);
           activations[i]->DetachObject();
@@ -483,6 +490,8 @@ class WmfAv1Encoder::Impl {
   bool reconfigure_ = false;
   bool initialized_ = false;
   int applied_bitrate_ = 0;
+  ULONG applied_qvs_ = 25;
+  bool speed_priority_ = false;
   int missed_idr_frames_ = 0;
   uint64_t sequence_ = 0;
   int input_frame_rate_ = 60;
@@ -513,6 +522,7 @@ int WmfAv1Encoder::Init(const MediaCodecConfig& config) {
   return impl_->worker_.Call([&] {
     impl_->fallback_.reset();
     impl_->config_ = config;
+    impl_->speed_priority_ = false;
     impl_->input_frame_rate_ = config.max_frame_rate;
     const int target_bps = EffectiveTargetBitrate(config);
     impl_->config_.init_bitrate = target_bps;
@@ -615,6 +625,26 @@ int WmfAv1Encoder::SetTargetFrameRate(int frame_rate) {
     impl_->config_.max_frame_rate = frame_rate;
     impl_->input_frame_rate_ = frame_rate;
     return 0;
+  });
+}
+
+int WmfAv1Encoder::SetPrioritizeEncodingSpeedOverQuality(bool prioritize_speed) {
+  return impl_->worker_.Call([&] {
+    if (impl_->fallback_ || !impl_->api_) return -1;
+    const ULONG target_qvs =
+        SelectQualityVsSpeed(impl_->config_, prioritize_speed);
+    if (target_qvs == impl_->applied_qvs_) {
+      impl_->speed_priority_ = prioritize_speed;
+      return 0;
+    }
+    const HRESULT hr = SetUint(impl_->api_.Get(),
+                               CODECAPI_AVEncCommonQualityVsSpeed, target_qvs);
+    if (hr == S_OK) {
+      impl_->speed_priority_ = prioritize_speed;
+      impl_->applied_qvs_ = target_qvs;
+      return 0;
+    }
+    return -1;
   });
 }
 
