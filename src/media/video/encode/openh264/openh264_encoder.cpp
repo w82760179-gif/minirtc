@@ -410,7 +410,7 @@ int OpenH264Encoder::SetTargetBitrate(int bitrate) {
 }
 
 int OpenH264Encoder::SetTargetFrameRate(int frame_rate) {
-  if (!openh264_encoder_ || frame_rate < 1 || frame_rate > 60) return -1;
+  if (!openh264_encoder_ || frame_rate < 1 || frame_rate > 120) return -1;
   if (frame_rate == max_fps_) return 0;
   float fps = static_cast<float>(frame_rate);
   const int result =

@@ -95,7 +95,7 @@ int DataChannelTransport::UpdateVideoSettings(
     MiniRtcVideoQuality quality, int frame_rate,
     MiniRtcVideoDegradationPreference preference) {
   if (quality < MiniRtcVideoQualityLow || quality > MiniRtcVideoQualityHigh ||
-      (frame_rate != 30 && frame_rate != 60) ||
+      (frame_rate != 30 && frame_rate != 60 && frame_rate != 90) ||
       preference > MiniRtcVideoDegradationPreference::Balanced)
     return -1;
   std::future<int> result;

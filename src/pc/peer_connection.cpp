@@ -70,7 +70,9 @@ bool IsValidTurnMode(MiniRtcTurnMode mode) {
 }
 
 int NormalizeVideoFrameRate(int frame_rate) {
-  return frame_rate == 30 ? 30 : 60;
+  if (frame_rate == 30) return 30;
+  if (frame_rate >= 90) return 90;
+  return 60;
 }
 
 MiniRtcVideoContentType ParseVideoContentType(const std::string& value) {

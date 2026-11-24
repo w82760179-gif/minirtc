@@ -238,7 +238,7 @@ int MiniRtcUpdateVideoSettings(MiniRtcPeerPtr* peer_ptr, const char* remote_id,
   if (!peer_ptr || !peer_ptr->peer_connection || !remote_id ||
       !remote_id_size || quality < MiniRtcVideoQualityLow ||
       quality > MiniRtcVideoQualityHigh ||
-      (frame_rate != 30 && frame_rate != 60) ||
+      (frame_rate != 30 && frame_rate != 60 && frame_rate != 90) ||
       preference > MiniRtcVideoDegradationPreference::Balanced)
     return -1;
   return peer_ptr->peer_connection->UpdateVideoSettings(

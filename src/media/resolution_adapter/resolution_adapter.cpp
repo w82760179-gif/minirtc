@@ -178,7 +178,7 @@ ResolutionAdapter::ResolutionAdapter(MiniRtcVideoQuality video_quality,
                                      MiniRtcVideoDegradationPreference
                                          video_degradation_preference)
     : video_quality_(video_quality),
-      video_frame_rate_(std::clamp(video_frame_rate, 15, 60)),
+      video_frame_rate_(std::clamp(video_frame_rate, 15, 120)),
       video_content_type_(video_content_type),
       video_degradation_preference_(video_degradation_preference) {}
 

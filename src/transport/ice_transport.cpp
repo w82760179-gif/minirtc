@@ -317,7 +317,8 @@ int IceTransport::SetLocalCapabilities(
   enable_srtp_ = enable_srtp;
   video_content_type_ = video_content_type;
   video_quality_ = video_quality;
-  video_frame_rate_ = video_frame_rate == 30 ? 30 : 60;
+  video_frame_rate_ =
+      video_frame_rate == 30 ? 30 : (video_frame_rate >= 90 ? 90 : 60);
   video_degradation_preference_ = video_degradation_preference;
   prefered_video_payload_type_ = prefered_video_payload_type;
   support_video_payload_types_ = video_payload_types;

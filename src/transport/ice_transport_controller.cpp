@@ -70,7 +70,8 @@ IceTransportController::IceTransportController(
       congestion_window_size_(DataSize::PlusInfinity()) {
   starting_bitrates_ = starting_bitrates;
   disable_receiver_padding_probing_ = disable_receiver_padding_probing;
-  media_config_.max_frame_rate = video_frame_rate == 30 ? 30 : 60;
+  media_config_.max_frame_rate =
+      video_frame_rate == 30 ? 30 : (video_frame_rate >= 90 ? 90 : 60);
   media_config_.video_content_type = video_content_type;
   media_config_.video_degradation_preference =
       video_degradation_preference;

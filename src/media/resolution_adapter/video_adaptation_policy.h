@@ -58,7 +58,7 @@ public:
   static int MinimumFrameRate(int configured_frame_rate,
                               bool balanced = false) {
     return balanced ? kBalancedFrameRate
-                    : (configured_frame_rate <= 30 ? 25 : 45);
+                    : (configured_frame_rate <= 30 ? 25 : (configured_frame_rate <= 60 ? 45 : 65));
   }
 
   static int UpgradeFrameRate(int configured_frame_rate,
@@ -70,7 +70,7 @@ public:
     // probing a higher spatial rung. A 60 fps stream that only just reaches
     // 45 fps at the lower resolution is very likely to fall below the floor
     // immediately after an upgrade.
-    return configured_frame_rate <= 30 ? 26 : 48;
+    return configured_frame_rate <= 30 ? 26 : (configured_frame_rate <= 60 ? 48 : 72);
   }
 
   static bool IsUpgradeFrameRateHealthy(int configured_frame_rate,
