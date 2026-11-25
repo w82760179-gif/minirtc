@@ -15,6 +15,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "api/clock/clock.h"
 #include "api/transport/network_types.h"
@@ -153,8 +154,6 @@ class IceTransportController
   int OnReceiveDataAckRtpPacket(const char* data, size_t size, uint32_t ssrc,
                                 const std::string& channel_name);
 
-  void OnReceiveCompleteFrame(std::unique_ptr<ReceivedFrame> received_frame,
-                              const std::string& channel_name);
   void OnReceiveCompleteAudio(const char* data, size_t size,
                               const std::string& channel_name,
                               uint16_t sequence, uint32_t timestamp);
@@ -227,6 +226,23 @@ class IceTransportController
   std::function<int(const char*, size_t)> CreateUnpacedSendFunction(
       StreamType type);
   enum class StreamDirection { kSend, kReceive };
+
+  // Each receive channel owns one counter. The output callback keeps its
+  // reservation alive across asynchronous decode, including drops and resets.
+  struct DecodeBacklog {
+    std::atomic<int> pending{0};
+    int64_t last_submission_ms = 0;  // Accessed only on the RTP delivery thread.
+  };
+  struct DecodeReservation {
+    explicit DecodeReservation(const std::shared_ptr<DecodeBacklog>& backlog)
+        : backlog(backlog), previously_pending(backlog->pending.fetch_add(1)) {}
+    ~DecodeReservation() { --backlog->pending; }
+    std::shared_ptr<DecodeBacklog> backlog;
+    const int previously_pending;
+  };
+  void OnReceiveCompleteFrame(std::unique_ptr<ReceivedFrame> received_frame,
+                              const std::string& channel_name,
+                              std::shared_ptr<DecodeReservation> reservation);
 
   class StreamContext {
    public:
@@ -350,10 +366,58 @@ class IceTransportController
     bool encode_queue_delay_window_ready = false;
     int average_encode_queue_delay_ms = 0;
     int p95_encode_queue_delay_ms = 0;
+
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
+    // Encode-path stage timings in microseconds, sampled over the same window
+    // as the queue delay. Splitting the path is what tells a frame-budget
+    // overrun apart: the capture-side copy into RawFrame, the whole synchronous
+    // Encode() call, and (for hardware encoders that report it) the
+    // host-to-device copy and the encoder call inside it.
+    struct StageTiming {
+      std::deque<std::pair<int64_t, int64_t>> samples;
+
+      void Add(int64_t now_ms, int64_t value_us, int64_t window_ms) {
+        if (value_us < 0) return;
+        samples.emplace_back(now_ms, value_us);
+        while (!samples.empty() && samples.front().first < now_ms - window_ms) {
+          samples.pop_front();
+        }
+      }
+
+      // Compute the aggregate only when the health log is due. A stage may
+      // have stopped producing samples before the other stages.
+      std::pair<int64_t, int64_t> Summary(int64_t since_ms) const {
+        int64_t sum = 0;
+        std::vector<int64_t> values;
+        values.reserve(samples.size());
+        for (const auto& [time, value] : samples) {
+          if (time < since_ms) continue;
+          values.push_back(value);
+          sum += value;
+        }
+        if (values.empty()) return {0, 0};
+        const size_t p95 = (values.size() * 95 + 99) / 100 - 1;
+        std::nth_element(values.begin(), values.begin() + p95, values.end());
+        return {sum / static_cast<int64_t>(values.size()), values[p95]};
+      }
+    };
+    uint64_t encode_timing_generation = 0;
+    StageTiming encode_copy_timing;
+    StageTiming encode_sync_timing;
+    StageTiming encoder_upload_timing;
+    StageTiming encoder_submit_timing;
+#endif
     int64_t encode_backlog_since_ms = 0;
     int64_t severe_encode_backlog_since_ms = 0;
     int64_t critical_encode_backlog_since_ms = 0;
     int64_t post_upgrade_protection_until_ms = 0;
+    // Receive side. Inputs submitted since the decoder last delivered a frame.
+    // A decoder without a synchronization point ignores delta access units and
+    // still reports success, so this count is the only observable signal. The
+    // decode task increments it; output delivery, which may run on a decoder
+    // thread, clears it.
+    std::atomic<int> decode_inputs_without_output{0};
+    int64_t last_decode_stall_request_ms = 0;
 
     void FinishStartupKeyframe() {
       startup_keyframe_pending = false;
@@ -456,6 +520,13 @@ class IceTransportController
       encode_backlog_since_ms = 0;
       severe_encode_backlog_since_ms = 0;
       critical_encode_backlog_since_ms = 0;
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
+      ++encode_timing_generation;
+      encode_copy_timing.samples.clear();
+      encode_sync_timing.samples.clear();
+      encoder_upload_timing.samples.clear();
+      encoder_submit_timing.samples.clear();
+#endif
     }
 
     std::shared_ptr<MediaChannel> transceiver;

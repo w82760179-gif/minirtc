@@ -355,6 +355,10 @@ typedef struct MiniRtcNetTrafficStats {
   // available; distinct backends across streams are joined with " / ".
   char video_encoder[128] = {};
   char video_decoder[128] = {};
+  /// Selected direct ICE endpoints as IPv4:port or [IPv6]:port.
+  /// Both are empty for relay paths and before a pair is selected.
+  char local_endpoint[64] = {};
+  char remote_endpoint[64] = {};
 } MiniRtcNetTrafficStats;
 
 // -----------------------------------------------------------------------------
@@ -499,7 +503,7 @@ typedef struct {
   char signal_server_ip[256];
   /// WSS port; no automatic default in direct mode.
   int signal_server_port;
-  /// Logger directory; an empty value uses "logs".
+  /// Logger directory for MiniRtcCreatePeer; an empty value uses "logs".
   char log_path[256];
   /// Request available hardware H.264 codecs; build/device support still applies.
   bool hardware_acceleration;
@@ -624,7 +628,7 @@ typedef struct MiniRtcDirectOptions {
  * A callback receives diagnostics on the asynchronous logging worker and owns
  * filtering/storage. It replaces the default console/rotating-file outputs.
  * A null callback selects default outputs; MiniRtcLogOff disables logging.
- * Default file output uses the directory selected by MiniRtcParams::log_path.
+ * Default file output uses the log directory selected at peer creation.
  *
  * Calls are serialized. Replacement waits for the previous callback to finish,
  * so its user_data may be released after this function returns successfully.
@@ -659,6 +663,15 @@ MINIRTC_API int MiniRtcSetAndroidJavaVm(void* java_vm);
  * with MiniRtcDestroyPeer. Allocation failures are not converted to a null return.
  */
 MINIRTC_API MiniRtcPeerPtr* MiniRtcCreatePeer(const MiniRtcParams* params);
+
+/**
+ * @brief Create a peer with a log directory supplied outside the fixed-size params field.
+ * @param log_directory Null-terminated path, read during this call. A null pointer
+ * selects params->log_path. An empty path selects "logs".
+ * The process-wide logger keeps its directory once initialized.
+ */
+MINIRTC_API MiniRtcPeerPtr* MiniRtcCreatePeerWithLogDirectory(
+    const MiniRtcParams* params, const char* log_directory);
 
 /**
  * @brief Read configuration and start asynchronous signaling/login.

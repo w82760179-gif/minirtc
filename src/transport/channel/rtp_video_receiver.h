@@ -76,6 +76,12 @@ class RtpVideoReceiver : public ThreadBase {
           on_receive_complete_frame) {
     on_receive_complete_frame_ = on_receive_complete_frame;
   }
+  // Called only for a complete, decodable frame. Recovery and expiry keep
+  // running while the consumer is full.
+  void SetFrameAdmissionFunc(std::function<bool(bool is_keyframe)> frame_admission) {
+    std::lock_guard<std::mutex> lock(pending_frames_mtx_);
+    frame_admission_ = std::move(frame_admission);
+  }
   uint32_t GetSsrc() { return ssrc_; }
   uint32_t GetRemoteSsrc() { return remote_ssrc_.load(); }
 
@@ -188,6 +194,7 @@ class RtpVideoReceiver : public ThreadBase {
     bool soft_fir_requested = false;
     int64_t last_progress_time = 0;
     uint64_t request_generation = 0;
+    std::optional<int64_t> admission_blocked_since_ms;
   };
   struct RtpTimestampLess {
     bool operator()(uint32_t lhs, uint32_t rhs) const {
@@ -196,6 +203,7 @@ class RtpVideoReceiver : public ThreadBase {
   };
   std::map<uint32_t, PendingFrame, RtpTimestampLess> pending_frames_;
   std::mutex pending_frames_mtx_;
+  std::function<bool(bool is_keyframe)> frame_admission_;
   bool awaiting_keyframe_ = false;
   std::optional<uint32_t> last_discarded_frame_ts_;
 
@@ -243,6 +251,10 @@ class RtpVideoReceiver : public ThreadBase {
   // decoder's reference chain; repairing this frame can end its event.
   std::optional<uint32_t> soft_keyframe_request_timestamp_;
   int64_t last_recovery_stats_log_ms_ = 0;
+  // Latest measured RTT (ms) mirrored out of NackRequester so the FIR retry
+  // interval can be computed without taking nack_mtx_ under rtcp_sender_mtx_.
+  // 0 means no sample yet.
+  std::atomic<int64_t> recovery_rtt_ms_{0};
   std::atomic<bool> is_running_;
 
  private:
@@ -265,6 +277,9 @@ class RtpVideoReceiver : public ThreadBase {
   std::atomic<uint64_t> recovery_discarded_frames_{0};
   std::atomic<uint64_t> recovery_soft_stalls_{0};
   std::atomic<uint64_t> recovery_hard_timeouts_{0};
+  // Ticks where a completed frame was held because the decode consumer was
+  // behind. Non-zero means the viewer is decode-bound, not network-bound.
+  std::atomic<uint64_t> recovery_admission_stalls_{0};
   std::atomic<uint64_t> recovery_obsolete_packets_{0};
   std::atomic<uint64_t> recovery_accepted_rtx_packets_{0};
   std::atomic<uint64_t> recovery_late_rtx_packets_{0};

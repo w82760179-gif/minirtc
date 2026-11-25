@@ -131,6 +131,10 @@ class MediaCodec {
     return 0;
   }
 
+  // Invoked on the decode queue before a fresh keyframe if outstanding
+  // asynchronous submissions stopped completing.
+  virtual void RecoverAtKeyFrame() {}
+
   virtual int ForceIdr() { return 0; }
 
   virtual int SetTargetBitrate(int bitrate) { return 0; }
@@ -150,6 +154,18 @@ class MediaCodec {
   virtual bool SupportsNativeFrameInput(
       MiniRtcNativeVideoFrameType frame_type) const {
     (void)frame_type;
+    return false;
+  }
+
+  // Hardware encoders that can separate their internal stages report how long
+  // the last Encode() spent copying the frame into device memory and in the
+  // encoder call itself. Everything else returns false, which keeps the caller
+  // from attributing the whole call to one stage. Not part of the render or
+  // media contract: diagnostics only, no behaviour depends on it.
+  virtual bool GetLastEncodeStageTimingUs(int64_t* upload_us,
+                                          int64_t* submit_us) const {
+    (void)upload_us;
+    (void)submit_us;
     return false;
   }
 
