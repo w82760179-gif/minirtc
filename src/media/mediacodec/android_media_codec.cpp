@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <thread>
 
 #include "android_codec_support.h"
 
@@ -407,6 +408,7 @@ int AndroidMediaCodec::InitEncoder(const MediaCodecConfig& config) {
 }
 bool AndroidMediaCodec::Configure(int w, int h) {
   StopCodec();
+  consecutive_input_timeouts_ = 0;
   width_ = w;
   height_ = h;
   if (!AndroidMediaCodec::IsValidSize(w, h)) return false;
@@ -514,9 +516,14 @@ bool AndroidMediaCodec::Configure(int w, int h) {
       const int ha = std::clamp(info.height_alignment, 2, 128);
       const int aligned_w = ((w + wa - 1) / wa) * wa;
       const int aligned_h = ((h + ha - 1) / ha) * ha;
-      if ((aligned_w != w || aligned_h != h) &&
-          try_configure(info, aligned_w, aligned_h, false)) {
-        return true;
+      if (aligned_w != w || aligned_h != h) {
+        if (info.low_latency &&
+            try_configure(info, aligned_w, aligned_h, true)) {
+          return true;
+        }
+        if (try_configure(info, aligned_w, aligned_h, false)) {
+          return true;
+        }
       }
     }
   }
@@ -620,7 +627,7 @@ AndroidMediaCodec::Result AndroidMediaCodec::Encode(
 AndroidMediaCodec::Result AndroidMediaCodec::Decode(
     const ReceivedFrame& frame,
     std::function<void(const DecodedFrame*)> callback) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   if (encoder_ || !frame.Buffer() || !frame.Size() ||
       frame.Size() > 8 * 1024 * 1024)
     return Result::InvalidInput;
@@ -640,12 +647,24 @@ AndroidMediaCodec::Result AndroidMediaCodec::Decode(
   if ((!state_ || width_ != w || height_ != h) && !Configure(w, h)) {
     return Result::ConfigureFailed;
   }
+  auto expected_state = state_;
   bool success = false;
-  {
-    std::lock_guard<std::mutex> codec_lock(state_->mutex);
-    auto& s = *state_;
-    if (!s.failed) {
-      const ssize_t index = AMediaCodec_dequeueInputBuffer(s.codec, 10000);
+  bool fatal = false;
+  constexpr int kMaxInputAttempts = 25;
+  for (int attempt = 0; attempt < kMaxInputAttempts; ++attempt) {
+    if (stopping_ || !state_ || state_ != expected_state) {
+      return Result::InvalidInput;
+    }
+    ssize_t index = AMEDIACODEC_INFO_TRY_AGAIN_LATER;
+    {
+      std::lock_guard<std::mutex> codec_lock(state_->mutex);
+      auto& s = *state_;
+      if (s.failed || !s.codec || !s.started) {
+        fatal = true;
+        break;
+      }
+      index = AMediaCodec_dequeueInputBuffer(s.codec,
+                                             attempt == 0 ? 2000 : 1000);
       if (index >= 0) {
         size_t capacity = 0;
         auto* input = AMediaCodec_getInputBuffer(s.codec, index, &capacity);
@@ -655,20 +674,48 @@ AndroidMediaCodec::Result AndroidMediaCodec::Decode(
               std::max(next_pts_ + 1, clock_->CurrentTimeUs());
           success = AMediaCodec_queueInputBuffer(
                         s.codec, index, 0, frame.Size(), pts, 0) == AMEDIA_OK;
-          if (success)
+          if (success) {
             s.pending.emplace(pts, Pending{frame.CapturedTimestamp(),
                                            frame.ReceivedTimestamp(),
                                            clock_->CurrentTimeUs(),
                                            {},
                                            callback});
+          } else {
+            s.failed = true;
+            fatal = true;
+          }
+        } else {
+          fatal = true;
         }
+        break;
+      }
+      if (index != AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+        s.failed = true;
+        fatal = true;
+        break;
       }
     }
+    // Release both locks briefly so DrainLoop and Surface Render() can drain
+    // output buffers and return input slots under high-res backpressure.
+    ++input_sequence_;
+    wake_.notify_one();
+    lock.unlock();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    lock.lock();
   }
   if (success) {
+    consecutive_input_timeouts_ = 0;
     ++input_sequence_;
     wake_.notify_one();
     return Result::Ok;
+  }
+  if (!fatal && !stopping_ && state_ && state_ == expected_state) {
+    ++consecutive_input_timeouts_;
+    if (consecutive_input_timeouts_ < 5) {
+      LOG_WARN("MediaCodec [{}] {}x{} input busy (streak={}), keeping HW decoder",
+               expected_state->name, w, h, consecutive_input_timeouts_);
+      return Result::NeedKeyFrame;
+    }
   }
   return Result::CodecError;
 }

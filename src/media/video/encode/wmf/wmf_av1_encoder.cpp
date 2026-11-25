@@ -73,12 +73,12 @@ ULONG SelectQualityVsSpeed(const MediaCodecConfig& config,
           MiniRtcVideoDegradationPreference::MaintainFrameRate) {
     return 0;
   }
-  // Above ~3.5M px (e.g. 2400x1696 / 2780x1264 / 3000x2120) at >30 fps,
-  // QvS=25 takes ~10 ms/frame on Intel Arc AV1; QvS=0 keeps high-DPI high-fps
-  // sessions responsive while <=2M px desktop modes stay at QvS=25.
+  // Above ~2.5M px (e.g. 2016x1424 / 2400x1696 / 2780x1264 / 3000x2120) at >30 fps,
+  // QvS=25 takes ~8-10 ms/frame on Intel Arc AV1; QvS=0 keeps high-DPI high-fps
+  // sessions responsive while <=2M px desktop modes (1650x1166 / 1960x892) stay at QvS=25.
   const int64_t pixels =
       static_cast<int64_t>(config.init_width) * config.init_height;
-  if (config.max_frame_rate > 30 && pixels >= 3500000) {
+  if (config.max_frame_rate > 30 && pixels >= 2500000) {
     return 0;
   }
   if (config.max_frame_rate > 30 || pixels > 4200000) {

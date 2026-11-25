@@ -62,6 +62,7 @@ class AndroidMediaCodec final {
   int width_ = 0, height_ = 0;
   int64_t next_pts_ = 0;
   uint64_t input_sequence_ = 0;
+  int consecutive_input_timeouts_ = 0;
 };
 }  // namespace minirtc
 
