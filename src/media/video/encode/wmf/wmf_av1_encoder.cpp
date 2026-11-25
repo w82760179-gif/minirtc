@@ -73,10 +73,14 @@ ULONG SelectQualityVsSpeed(const MediaCodecConfig& config,
           MiniRtcVideoDegradationPreference::MaintainFrameRate) {
     return 0;
   }
-  // At 60 fps (16.6 ms budget) or >4.2M px, QvS=25 keeps Intel Arc AV1 encode
-  // well within budget while preserving sharp desktop text.
+  // Above ~3.5M px (e.g. 2400x1696 / 2780x1264 / 3000x2120) at >30 fps,
+  // QvS=25 takes ~10 ms/frame on Intel Arc AV1; QvS=0 keeps high-DPI high-fps
+  // sessions responsive while <=2M px desktop modes stay at QvS=25.
   const int64_t pixels =
       static_cast<int64_t>(config.init_width) * config.init_height;
+  if (config.max_frame_rate > 30 && pixels >= 3500000) {
+    return 0;
+  }
   if (config.max_frame_rate > 30 || pixels > 4200000) {
     return 25;
   }
