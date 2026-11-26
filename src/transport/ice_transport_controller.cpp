@@ -4172,6 +4172,19 @@ void IceTransportController::UpdateFecProtection() {
         const auto snapshot = c->video_send_diagnostics.Take(now_ms);
         for (size_t kind = 0; kind < snapshot.frames.size(); ++kind) {
           const auto& timing = snapshot.frames[kind];
+          if (timing.first_packet.max_ms >= kDesktopFrameAdmissionQueueMs ||
+              timing.last_packet.max_ms >= kDesktopPacerQueueLimitMs ||
+              (kind == 0 && snapshot.rejected != 0)) {
+            LOG_INFO("Video send queue pressure: stream={} frame={} interval_ms={} "
+                     "encode_to_first_max_ms={} encode_to_last_max_ms={} "
+                     "expected_queue_max_ms={} oldest_wait_max_ms={} rejected={} "
+                     "target={}x{}",
+                     item.first, kind ? "key" : "delta", snapshot.interval_ms,
+                     timing.first_packet.max_ms, timing.last_packet.max_ms,
+                     snapshot.expected_queue_max_ms, snapshot.oldest_wait_max_ms,
+                     snapshot.rejected, c->target_width.value_or(0),
+                     c->target_height.value_or(0));
+          }
           if (!timing.encoded && !timing.first_packet.count &&
               !timing.last_packet.count) continue;
           LOG_DEBUG("Video send timing: stream={} frame={} interval_ms={} "

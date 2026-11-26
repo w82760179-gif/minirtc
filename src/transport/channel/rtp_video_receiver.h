@@ -110,7 +110,7 @@ class RtpVideoReceiver : public ThreadBase {
                         uint32_t packet_count, uint32_t timestamp);
   bool RestoreMediaPacketFromRtx(RtpPacket& rtx_packet,
                                  RtpPacket* media_packet);
-  void TrackPendingFramePacket(uint32_t timestamp, uint16_t sequence_number,
+  bool TrackPendingFramePacket(uint32_t timestamp, uint16_t sequence_number,
                                bool is_keyframe);
   bool GetFrameSequenceRange(uint32_t timestamp, const char* codec_name,
                              uint16_t* start_sequence_number,
@@ -127,6 +127,7 @@ class RtpVideoReceiver : public ThreadBase {
                                                      uint32_t timestamp);
   void DropFrameAssembly(uint32_t timestamp);
   bool IsFrameTimestampObsolete(uint32_t timestamp);
+  bool IsFrameTimestampObsoleteLocked(uint32_t timestamp) const;
   void MarkFrameDiscardedLocked(uint32_t timestamp);
   struct FrameRecoveryTiming {
     int64_t soft_deadline_ms;
@@ -280,6 +281,9 @@ class RtpVideoReceiver : public ThreadBase {
   // Ticks where a completed frame was held because the decode consumer was
   // behind. Non-zero means the viewer is decode-bound, not network-bound.
   std::atomic<uint64_t> recovery_admission_stalls_{0};
+  // Updated by Process() and drained after it stops during teardown.
+  uint64_t recovery_admission_expired_frames_ = 0;
+  int64_t recovery_max_admission_wait_ms_ = 0;
   std::atomic<uint64_t> recovery_obsolete_packets_{0};
   std::atomic<uint64_t> recovery_accepted_rtx_packets_{0};
   std::atomic<uint64_t> recovery_late_rtx_packets_{0};

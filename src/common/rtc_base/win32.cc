@@ -14,6 +14,7 @@
 #include <ws2tcpip.h>
 
 #include <algorithm>
+#include <cstdio>
 
 #include "rtc_base/arraysize.h"
 #include "rtc_base/byte_order.h"

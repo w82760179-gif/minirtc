@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <utility>
 #include <vector>
 
 #include "common.h"
@@ -36,6 +37,10 @@ uint16_t SequenceNumberAt(uint16_t start_sequence_number, uint32_t offset) {
 }
 
 constexpr int64_t kMaxFrameAssemblyMs = 1500;
+// A complete delta held by the decoder has a separate latency budget from
+// packet assembly and RTX. Keep the last update if no newer frame is complete.
+constexpr int64_t kMaxDecodeAdmissionWaitMs = 100;
+constexpr int64_t kDecodeAdmissionLogThresholdMs = 50;
 
 bool IsH264KeyFrame(const uint8_t* data, size_t size) {
   if (!data) {
@@ -169,11 +174,13 @@ bool RtpVideoReceiver::RestoreMediaPacketFromRtx(RtpPacket& rtx_packet,
   return media_packet->Build(media_buffer.data(), media_buffer.size());
 }
 
-void RtpVideoReceiver::TrackPendingFramePacket(uint32_t timestamp,
-                                               uint16_t sequence_number,
-                                               bool is_keyframe) {
+bool RtpVideoReceiver::TrackPendingFramePacket(uint32_t timestamp,
+                                              uint16_t sequence_number,
+                                              bool is_keyframe) {
   std::lock_guard<std::mutex> lock(pending_frames_mtx_);
+  if (IsFrameTimestampObsoleteLocked(timestamp)) return false;
   PendingFrame& pending_frame = pending_frames_[timestamp];
+  if (pending_frame.is_complete) return false;
   if (!pending_frame.last_sequence_number) {
     pending_frame.arrival_time = clock_->CurrentTime().ms();
     pending_frame.request_generation =
@@ -187,6 +194,7 @@ void RtpVideoReceiver::TrackPendingFramePacket(uint32_t timestamp,
     // Duplicates and late repairs do not extend the receive deadline.
     pending_frame.last_progress_time = clock_->CurrentTime().ms();
   }
+  return true;
 }
 
 bool RtpVideoReceiver::GetFrameSequenceRange(
@@ -222,6 +230,7 @@ void RtpVideoReceiver::CommitPendingFrame(
     bool is_keyframe, uint16_t end_sequence_number,
     bool require_existing_entry) {
   std::unique_lock<std::mutex> lock(pending_frames_mtx_);
+  if (IsFrameTimestampObsoleteLocked(timestamp)) return;
   auto pending_it = pending_frames_.find(timestamp);
   if (require_existing_entry && pending_it == pending_frames_.end()) {
     return;
@@ -230,6 +239,8 @@ void RtpVideoReceiver::CommitPendingFrame(
     pending_it = pending_frames_.try_emplace(timestamp).first;
   }
   PendingFrame& pending_frame = pending_it->second;
+  // Repeated media/RTX must not restart a complete frame's admission wait.
+  if (pending_frame.is_complete) return;
   const int64_t first_arrival_time =
       pending_frame.arrival_time != 0 ? pending_frame.arrival_time
                                       : clock_->CurrentTime().ms();
@@ -547,8 +558,6 @@ void RtpVideoReceiver::ProcessH264RtpPacket(RtpPacketH264& rtp_packet_h264) {
                          std::move(received_frame), is_keyframe,
                          rtp_packet_h264.SequenceNumber(), false);
     } else if (rtp::NAL_UNIT_TYPE::FU_A == nalu_type) {
-      incomplete_h264_frame_list_[rtp_packet_h264.SequenceNumber()] =
-          rtp_packet_h264;
       CheckIsH264FrameCompleted(rtp_packet_h264,
                                 rtp_packet_h264.FuAStart(),
                                 rtp_packet_h264.FuAEnd());
@@ -557,11 +566,7 @@ void RtpVideoReceiver::ProcessH264RtpPacket(RtpPacketH264& rtp_packet_h264) {
 }
 
 void RtpVideoReceiver::ProcessAv1RtpPacket(RtpPacketAv1& rtp_packet_av1) {
-  {
-    incomplete_av1_frame_list_[rtp_packet_av1.SequenceNumber()] =
-        rtp_packet_av1;
-    CheckIsAv1FrameCompleted(rtp_packet_av1);
-  }
+  CheckIsAv1FrameCompleted(rtp_packet_av1);
 }
 
 bool RtpVideoReceiver::CheckIsH264FrameCompleted(RtpPacketH264& rtp_packet_h264,
@@ -571,10 +576,13 @@ bool RtpVideoReceiver::CheckIsH264FrameCompleted(RtpPacketH264& rtp_packet_h264,
   uint16_t start_seq, end_seq;
   uint32_t packet_count;
 
-  TrackPendingFramePacket(
-      timestamp, seq,
-      is_start && IsH264KeyFrame(rtp_packet_h264.Payload(),
-                                 rtp_packet_h264.PayloadSize()));
+  if (!TrackPendingFramePacket(
+          timestamp, seq,
+          is_start && IsH264KeyFrame(rtp_packet_h264.Payload(),
+                                     rtp_packet_h264.PayloadSize()))) {
+    return false;
+  }
+  incomplete_h264_frame_list_[seq] = rtp_packet_h264;
 
   if (is_start) {
     fua_start_sequence_numbers_[timestamp] = seq;
@@ -654,7 +662,10 @@ bool RtpVideoReceiver::CheckIsAv1FrameCompleted(RtpPacketAv1& rtp_packet_av1) {
   uint16_t start_seq, end_seq;
   uint32_t packet_count;
 
-  TrackPendingFramePacket(timestamp, seq, rtp_packet_av1.IsKeyFrame());
+  if (!TrackPendingFramePacket(timestamp, seq, rtp_packet_av1.IsKeyFrame())) {
+    return false;
+  }
+  incomplete_av1_frame_list_[seq] = rtp_packet_av1;
 
   if (rtp_packet_av1.Av1FrameStart()) {
     fua_start_sequence_numbers_[timestamp] = seq;
@@ -857,6 +868,16 @@ void RtpVideoReceiver::MaybeLogRecoveryStats(bool force) {
   const uint64_t soft_stalls = take(recovery_soft_stalls_);
   const uint64_t hard_timeouts = take(recovery_hard_timeouts_);
   const uint64_t admission_stalls = take(recovery_admission_stalls_);
+  const auto admission_expired =
+      std::exchange(recovery_admission_expired_frames_, 0);
+  const auto max_admission_wait_ms =
+      std::exchange(recovery_max_admission_wait_ms_, 0);
+  if (admission_expired != 0 ||
+      max_admission_wait_ms >= kDecodeAdmissionLogThresholdMs) {
+    LOG_INFO("Video decode admission pressure: channel={} interval_ms={} "
+             "max_wait_ms={} expired_delta_frames={}",
+             log_context_, interval_ms, max_admission_wait_ms, admission_expired);
+  }
   const uint64_t obsolete_packets = take(recovery_obsolete_packets_);
   const uint64_t accepted_rtx_packets =
       take(recovery_accepted_rtx_packets_);
@@ -1068,6 +1089,10 @@ void RtpVideoReceiver::DropFrameAssembly(uint32_t timestamp) {
 
 bool RtpVideoReceiver::IsFrameTimestampObsolete(uint32_t timestamp) {
   std::lock_guard<std::mutex> lock(pending_frames_mtx_);
+  return IsFrameTimestampObsoleteLocked(timestamp);
+}
+
+bool RtpVideoReceiver::IsFrameTimestampObsoleteLocked(uint32_t timestamp) const {
   const bool already_completed =
       last_complete_frame_ts_.has_value() &&
       !webrtc::AheadOf(timestamp, *last_complete_frame_ts_);
@@ -1103,6 +1128,7 @@ bool RtpVideoReceiver::Process() {
     uint32_t dropped_timestamp = 0;
     bool dropped_frame = false;
     bool recovery_timed_out = false;
+    bool decode_admission_expired = false;
     std::optional<FailedKeyFrame> failed_keyframe;
     bool soft_stall_started = false;
     bool request_soft_fir = false;
@@ -1137,9 +1163,7 @@ bool RtpVideoReceiver::Process() {
               : (!it->second.is_complete
                      ? now_ms - it->second.last_progress_time
                      : frame_age_ms);
-      const bool is_older_than_decoded_frame =
-          last_complete_frame_ts_.has_value() &&
-          !webrtc::AheadOf(it->first, *last_complete_frame_ts_);
+      const bool obsolete = IsFrameTimestampObsoleteLocked(it->first);
       bool newer_complete_keyframe_available = false;
       if ((awaiting_keyframe_ || it->second.recovery_escalated) &&
           !(it->second.is_complete && it->second.is_keyframe)) {
@@ -1153,7 +1177,7 @@ bool RtpVideoReceiver::Process() {
         }
       }
 
-      if (is_older_than_decoded_frame) {
+      if (obsolete) {
         dropped_timestamp = it->first;
         dropped_frame = true;
         pending_frames_.erase(it);
@@ -1163,6 +1187,7 @@ bool RtpVideoReceiver::Process() {
         awaiting_keyframe_ = true;
         dropped_timestamp = it->first;
         dropped_frame = true;
+        MarkFrameDiscardedLocked(dropped_timestamp);
         pending_frames_.erase(it);
       } else if (it->second.is_complete && awaiting_keyframe_ &&
                  !it->second.is_keyframe) {
@@ -1177,14 +1202,23 @@ bool RtpVideoReceiver::Process() {
       } else if (it->second.is_complete &&
                  (!has_blocking_nacks || (awaiting_keyframe_ && it->second.is_keyframe)) &&
                  (it->second.is_keyframe || frame_age_ms <= kMaxFrameAssemblyMs)) {
-        if (frame_admission_ && !frame_admission_(it->second.is_keyframe)) {
+        const bool admitted =
+            !frame_admission_ || frame_admission_(it->second.is_keyframe);
+        auto& blocked_since = it->second.admission_blocked_since_ms;
+        if (!admitted && !blocked_since) blocked_since = now_ms;
+        const auto wait_ms = blocked_since ? now_ms - *blocked_since : 0;
+        recovery_max_admission_wait_ms_ =
+            std::max(recovery_max_admission_wait_ms_, wait_ms);
+        if (!it->second.is_keyframe && wait_ms >= kMaxDecodeAdmissionWaitMs &&
+            std::any_of(std::next(it), pending_frames_.end(),
+                        [](const auto& next) { return next.second.is_complete; })) {
+          decode_admission_expired = true;
+        } else if (!admitted) {
           recovery_admission_stalls_.fetch_add(1, std::memory_order_relaxed);
-          if (!it->second.is_keyframe) break;
           // A complete IDR can recover a stalled decoder when its output
-          // timeout expires. Start its wait at the first admission refusal.
-          auto& since = it->second.admission_blocked_since_ms;
-          if (!since) since = now_ms;
-          if (now_ms - *since < video_recovery::kDecodeOutputTimeoutMs) break;
+          // timeout expires. Preserve that longer recovery window.
+          if (!it->second.is_keyframe ||
+              wait_ms < video_recovery::kDecodeOutputTimeoutMs) break;
           recovery_timed_out = true;
         } else {
           if (awaiting_keyframe_ && nack_ && it->second.last_sequence_number) {
@@ -1223,7 +1257,7 @@ bool RtpVideoReceiver::Process() {
         break;
       }
 
-      if (recovery_timed_out) {
+      if (recovery_timed_out || decode_admission_expired) {
         if (it->second.is_keyframe) {
           failed_keyframe = FailedKeyFrame{it->second.arrival_time,
                                           it->second.request_generation,
@@ -1231,10 +1265,12 @@ bool RtpVideoReceiver::Process() {
         }
         dropped_timestamp = it->first;
         dropped_frame = true;
-        LOG_DEBUG("Video frame recovery timeout: channel={} timestamp={} "
-                  "keyframe={} frame_age_ms={} recovery_age_ms={} missing={}",
-                  log_context_, it->first, it->second.is_keyframe, frame_age_ms,
-                  recovery_age_ms, has_blocking_nacks);
+        if (recovery_timed_out) {
+          LOG_DEBUG("Video frame recovery timeout: channel={} timestamp={} "
+                    "keyframe={} frame_age_ms={} recovery_age_ms={} missing={}",
+                    log_context_, it->first, it->second.is_keyframe, frame_age_ms,
+                    recovery_age_ms, has_blocking_nacks);
+        }
         awaiting_keyframe_ = true;
         if (nack_ && it->second.last_sequence_number.has_value()) {
           // Only abandon losses that can affect this frame. Newer frames,
@@ -1253,6 +1289,13 @@ bool RtpVideoReceiver::Process() {
     if (dropped_frame) {
       recovery_discarded_frames_.fetch_add(1, std::memory_order_relaxed);
       DropFrameAssembly(dropped_timestamp);
+    }
+
+    if (decode_admission_expired) {
+      ++recovery_admission_expired_frames_;
+      // The existing request path suppresses FIR while a keyframe is already
+      // queued or making progress. Continue the loop to consume it promptly.
+      MaybeRetryKeyFrameRequest();
     }
 
     if (soft_fir_avoided) {
